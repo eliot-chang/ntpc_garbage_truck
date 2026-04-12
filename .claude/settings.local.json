@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/opt/homebrew/bin/flutter emulators:*)",
+      "Read(//Users/eliot/Library/Android/sdk/emulator/**)",
+      "Bash(~/Library/Android/sdk/emulator/emulator -list-avds)",
+      "Read(//Users/eliot/Library/Android/sdk/cmdline-tools/latest/bin/**)",
+      "Bash(~/Library/Android/sdk/cmdline-tools/latest/bin/avdmanager list:*)",
+      "Bash(/opt/homebrew/bin/flutter create:*)",
+      "Bash(/opt/homebrew/bin/flutter run:*)",
+      "Bash(/opt/homebrew/bin/flutter devices:*)",
+      "Bash(curl -sv \"https://data.ntpc.gov.tw/api/datasets/EDC3AD26-8AE7-4916-BDBA-DBAC8B3D3B9B/json?size=5\")",
+      "Bash(curl -s -H \"User-Agent: Mozilla/5.0\" \"https://data.ntpc.gov.tw/api/datasets/EDC3AD26-8AE7-4916-BDBA-DBAC8B3D3B9B/json?size=5\")",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s -H \"User-Agent: Mozilla/5.0 \\(Macintosh; Intel Mac OS X 10_15_7\\) AppleWebKit/537.36\" -H \"Accept: application/json\" \"https://data.ntpc.gov.tw/api/datasets/EDC3AD26-8AE7-4916-BDBA-DBAC8B3D3B9B/json?size=5\")",
+      "Bash(/opt/homebrew/bin/flutter pub:*)",
+      "Bash(ls -la /Users/eliot/Dropbox/AI_playground/garbage_truck/*.csv)",
+      "Bash(pkill -f \"flutter\")",
+      "Bash(~/Library/Android/sdk/platform-tools/adb -s emulator-5554 logcat -d -s flutter)",
+      "Bash(~/Library/Android/sdk/platform-tools/adb -s emulator-5554 logcat -c)",
+      "Bash(curl -s --max-time 15 \"https://data.ntpc.gov.tw/api/datasets/edc3ad26-8ae7-4916-a00b-bc6048d19bf8/csv?page=0&size=3\")",
+      "Bash(~/Library/Android/sdk/platform-tools/adb -s emulator-5554 reboot)",
+      "Bash(~/Library/Android/sdk/platform-tools/adb -s emulator-5554 shell getprop sys.boot_completed)",
+      "Bash(sort -t',' -k1,1 -k3,3n)",
+      "Bash(curl -s \"https://data.taipei/api/v1/dataset/6bb3304b-4f46-4bb0-8cd1-60c66dcd1cae?scope=resourceAquire&limit=3\")",
+      "Bash(curl -sv \"https://data.taipei/api/v1/dataset/6bb3304b-4f46-4bb0-8cd1-60c66dcd1cae?scope=resourceAquire&limit=3\")",
+      "WebSearch",
+      "Bash(curl -s \"https://data.taipei/api/v1/dataset/6bb3304b-4f46-4bb0-8cd1-60c66dcd1cae?scope=resourceAquire&limit=3&offset=0\")",
+      "WebFetch(domain:data.taipei)",
+      "Bash(curl -s -L \"https://data.taipei/api/frontstage/tpeod/dataset/resource.download?rid=a6e90031-7ec4-4089-afb5-361a4efe7202\")",
+      "Bash(curl -s -L \"https://data.taipei/api/frontstage/tpeod/dataset/resource.download?rid=a6e90031-7ec4-4089-afb5-361a4efe7202\" -o /Users/eliot/Dropbox/AI_playground/garbage_truck/assets/taipei_route_stops.csv)",
+      "Bash(curl -s \"https://data.taipei/api/v1/dataset/a6e90031-7ec4-4089-afb5-361a4efe7202?scope=resourceAquire&limit=2\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); r=d[''''result''''][''''results''''][0]; print\\(list\\(r.keys\\(\\)\\)\\)\")",
+      "Bash(/opt/homebrew/bin/flutter build:*)",
+      "Bash(~/Library/Android/sdk/platform-tools/adb -s N7AIB700V172PD8 install -r /Users/eliot/Dropbox/AI_playground/garbage_truck/build/app/outputs/flutter-apk/app-release.apk)",
+      "Bash(ls -d /Users/eliot/Dropbox/AI_playground/garbage_truck/*/)",
+      "Bash(ls -lh /Users/eliot/Dropbox/AI_playground/garbage_truck/*.csv)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}
