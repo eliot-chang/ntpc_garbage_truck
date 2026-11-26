@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../services/settings_service.dart';
 import '../services/notification_service.dart';
+import '../services/cache_service.dart';
 
 class SettingsPage extends StatelessWidget {
   final SettingsService settingsService;
@@ -106,11 +107,16 @@ class SettingsPage extends StatelessWidget {
             ),
             const Divider(height: 32),
 
+            // ─── 儲存空間 ───
+            _sectionHeader(context, '儲存空間', Icons.storage_outlined),
+            const _CacheTile(),
+            const Divider(height: 32),
+
             // ─── 關於 ───
             _sectionHeader(context, '關於', Icons.info_outlined),
             const ListTile(
               title: Text('新北市垃圾車時刻表'),
-              subtitle: Text('版本 1.0.0\n資料來源：新北市政府開放資料平臺'),
+              subtitle: Text('版本 1.0.1\n資料來源：新北市政府開放資料平臺'),
             ),
           ],
         );
@@ -132,6 +138,75 @@ class SettingsPage extends StatelessWidget {
                 color: Colors.green.shade700,
               )),
         ],
+      ),
+    );
+  }
+}
+
+class _CacheTile extends StatefulWidget {
+  const _CacheTile();
+
+  @override
+  State<_CacheTile> createState() => _CacheTileState();
+}
+
+class _CacheTileState extends State<_CacheTile> {
+  final CacheService _cacheService = CacheService();
+  int? _cacheBytes;
+  bool _clearing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSize();
+  }
+
+  Future<void> _loadSize() async {
+    final bytes = await _cacheService.getCacheSizeBytes();
+    if (mounted) setState(() => _cacheBytes = bytes);
+  }
+
+  Future<void> _clearCache() async {
+    setState(() => _clearing = true);
+    await _cacheService.clear();
+    await _loadSize();
+    if (mounted) {
+      setState(() => _clearing = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('已清除路線快取並回收空間')),
+      );
+    }
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MB';
+  }
+
+  @override
+  void dispose() {
+    _cacheService.close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final subtitle = _cacheBytes == null
+        ? '計算中...'
+        : '本地路線快取：${_formatBytes(_cacheBytes!)}';
+    return ListTile(
+      title: const Text('清除路線快取'),
+      subtitle: Text(subtitle),
+      trailing: OutlinedButton(
+        onPressed: _clearing ? null : _clearCache,
+        child: _clearing
+            ? const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Text('清除'),
       ),
     );
   }
