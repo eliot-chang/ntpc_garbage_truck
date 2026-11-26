@@ -87,6 +87,57 @@ class RouteStop {
     return map;
   }
 
+  /// 精簡陣列序列化（供 SQLite gzip 快取使用，避免重複 key 名稱膨脹體積）
+  /// 格式：[city, lineId, lineName, rank, name, village, lng, lat, time, memo, daysMask]
+  List<dynamic> toCompact() {
+    int mask = 0;
+    for (int d = 1; d <= 7; d++) {
+      if (garbageDays[d] == true) mask |= (1 << (d - 1));
+      if (recyclingDays[d] == true) mask |= (1 << (d + 6));
+      if (foodScrapsDays[d] == true) mask |= (1 << (d + 13));
+    }
+    return [
+      city,
+      lineId,
+      lineName,
+      rank,
+      name,
+      village,
+      longitude,
+      latitude,
+      time,
+      memo,
+      mask,
+    ];
+  }
+
+  factory RouteStop.fromCompact(List<dynamic> data) {
+    final mask = (data[10] as num).toInt();
+    final garbage = <int, bool>{};
+    final recycling = <int, bool>{};
+    final foodScraps = <int, bool>{};
+    for (int d = 1; d <= 7; d++) {
+      garbage[d] = (mask & (1 << (d - 1))) != 0;
+      recycling[d] = (mask & (1 << (d + 6))) != 0;
+      foodScraps[d] = (mask & (1 << (d + 13))) != 0;
+    }
+    return RouteStop(
+      city: data[0] as String,
+      lineId: data[1] as String,
+      lineName: data[2] as String,
+      rank: (data[3] as num).toInt(),
+      name: data[4] as String,
+      village: data[5] as String,
+      longitude: (data[6] as num).toDouble(),
+      latitude: (data[7] as num).toDouble(),
+      time: data[8] as String,
+      memo: data[9] as String,
+      garbageDays: garbage,
+      recyclingDays: recycling,
+      foodScrapsDays: foodScraps,
+    );
+  }
+
   bool isGarbageToday([DateTime? now]) {
     final weekday = (now ?? DateTime.now()).weekday;
     return garbageDays[weekday] ?? false;
