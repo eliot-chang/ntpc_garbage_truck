@@ -1,10 +1,26 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:http/http.dart' as http;
 import '../models/route_stop.dart';
 import '../models/truck_location.dart';
 import 'csv_parser.dart';
+
+/// 在背景 Isolate 解析新北市路線 CSV，避免阻塞主執行緒
+List<RouteStop> _parseRouteStopsCsvIsolate(String csvString) {
+  final rows = CsvParser.parse(csvString);
+  return rows.map((row) => RouteStop.fromJson(row)).toList(growable: false);
+}
+
+/// 在背景 Isolate 解析新北市即時車輛 CSV
+List<TruckLocation> _parseTruckLocationsCsvIsolate(String csvString) {
+  final rows = CsvParser.parse(csvString);
+  return rows
+      .map((row) => TruckLocation.fromJson(row))
+      .where((t) => t.hasValidCoordinates)
+      .toList(growable: false);
+}
 
 class ApiException implements Exception {
   final String message;
@@ -61,11 +77,10 @@ class ApiService {
     }
   }
 
-  /// 從內建 asset CSV 載入路線資料
+  /// 從內建 asset CSV 載入路線資料（背景 Isolate 解析）
   Future<List<RouteStop>> _loadRouteStopsFromAsset() async {
     final csvString = await rootBundle.loadString('assets/route_stops.csv');
-    final rows = CsvParser.parse(csvString);
-    return rows.map((row) => RouteStop.fromJson(row)).toList();
+    return compute(_parseRouteStopsCsvIsolate, csvString);
   }
 
   /// 從 CSV API 分頁載入路線資料（不被 WAF 擋）
@@ -81,10 +96,10 @@ class ApiService {
         final response = await _client.get(Uri.parse(url)).timeout(_timeout);
         if (response.statusCode != 200 || response.body.trimLeft().startsWith('<')) break;
 
-        final rows = CsvParser.parse(response.body);
-        if (rows.isEmpty) break;
+        final stops = await compute(_parseRouteStopsCsvIsolate, response.body);
+        if (stops.isEmpty) break;
 
-        allStops.addAll(rows.map((row) => RouteStop.fromJson(row)));
+        allStops.addAll(stops);
         page++;
         onProgress?.call(page, allStops.length);
 
@@ -107,12 +122,9 @@ class ApiService {
       final url = '$_baseUrl/$_locationDatasetId/csv?page=0&size=500';
       final response = await _client.get(Uri.parse(url)).timeout(_timeout);
       if (response.statusCode == 200 && !response.body.trimLeft().startsWith('<')) {
-        final rows = CsvParser.parse(response.body);
-        if (rows.isNotEmpty) {
-          final locations = rows
-              .map((row) => TruckLocation.fromJson(row))
-              .where((t) => t.hasValidCoordinates)
-              .toList();
+        final locations =
+            await compute(_parseTruckLocationsCsvIsolate, response.body);
+        if (locations.isNotEmpty) {
           _cachedTruckLocations = locations;
           return locations;
         }
@@ -147,11 +159,7 @@ class ApiService {
   Future<List<TruckLocation>> _loadTruckLocationsFromAsset() async {
     final csvString =
         await rootBundle.loadString('assets/truck_locations.csv');
-    final rows = CsvParser.parse(csvString);
-    return rows
-        .map((row) => TruckLocation.fromJson(row))
-        .where((t) => t.hasValidCoordinates)
-        .toList();
+    return compute(_parseTruckLocationsCsvIsolate, csvString);
   }
 
   // ─── 通用 HTTP ───

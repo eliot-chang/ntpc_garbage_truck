@@ -116,7 +116,7 @@ class SettingsPage extends StatelessWidget {
             _sectionHeader(context, '關於', Icons.info_outlined),
             const ListTile(
               title: Text('新北市垃圾車時刻表'),
-              subtitle: Text('版本 1.0.1\n資料來源：新北市政府開放資料平臺'),
+              subtitle: Text('版本 1.0.2\n資料來源：新北市政府開放資料平臺'),
             ),
           ],
         );

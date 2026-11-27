@@ -82,14 +82,10 @@ class MainScreen extends StatefulWidget {
 class _MainScreenState extends State<MainScreen> {
   int _currentIndex = 0;
 
-  late final List<Widget> _pages = [
-    HomePage(
-      favoritesService: widget.favoritesService,
-      settingsService: widget.settingsService,
-    ),
-    FavoritesPage(favoritesService: widget.favoritesService),
-    SettingsPage(settingsService: widget.settingsService),
-  ];
+  late final Widget _favoritesPage =
+      FavoritesPage(favoritesService: widget.favoritesService);
+  late final Widget _settingsPage =
+      SettingsPage(settingsService: widget.settingsService);
 
   final List<String> _titles = const [
     '附近車況',
@@ -106,7 +102,19 @@ class _MainScreenState extends State<MainScreen> {
               title: Text(_titles[_currentIndex]),
               backgroundColor: Theme.of(context).colorScheme.inversePrimary,
             ),
-      body: _pages[_currentIndex],
+      // IndexedStack 保留首頁 GoogleMap 與雙北 3 萬筆索引狀態，避免切 Tab 整頁銷毀重建
+      body: IndexedStack(
+        index: _currentIndex,
+        children: [
+          HomePage(
+            favoritesService: widget.favoritesService,
+            settingsService: widget.settingsService,
+            isActive: _currentIndex == 0,
+          ),
+          _favoritesPage,
+          _settingsPage,
+        ],
+      ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _currentIndex,
         onDestinationSelected: (index) {

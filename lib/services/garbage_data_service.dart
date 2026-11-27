@@ -24,13 +24,13 @@ class GarbageDataService extends ChangeNotifier {
   List<RouteStop> _allStops = [];
   List<TruckLocation> _truckLocations = [];
   List<String> _allCities = [];
-  bool _isLoading = false;
+  int _loadingCount = 0;
 
   CitySource get currentCity => _currentCity;
   List<RouteStop> get allStops => _allStops;
   List<TruckLocation> get truckLocations => _truckLocations;
   List<String> get allCities => _allCities;
-  bool get isLoading => _isLoading;
+  bool get isLoading => _loadingCount > 0;
 
   GarbageDataService({
     ApiService? ntpcService,
@@ -38,13 +38,13 @@ class GarbageDataService extends ChangeNotifier {
   })  : _ntpcService = ntpcService ?? ApiService(),
         _taipeiService = taipeiService ?? TaipeiApiService();
 
-  /// 載入路線資料
+  /// 載入路線資料並直接回傳結果（避免並行呼叫雙市時共用 _allStops 產生競態）
   /// 策略：SQLite 快取（24h）→ Asset CSV → API
-  Future<void> loadRouteStops({
+  Future<List<RouteStop>> loadRouteStops({
     required CitySource city,
     void Function(int loadedPages, int loadedItems)? onProgress,
   }) async {
-    _isLoading = true;
+    _loadingCount++;
     _currentCity = city;
     notifyListeners();
 
@@ -53,34 +53,37 @@ class GarbageDataService extends ChangeNotifier {
       final cached = await _cacheService.load(city.name);
       if (cached != null && cached.isNotEmpty) {
         _allStops = cached;
-        _allCities = _allStops.map((s) => s.city).toSet().toList()..sort();
-        onProgress?.call(1, _allStops.length);
-        debugPrint('[Cache] ${city.label} 從 SQLite 快取載入 ${_allStops.length} 筆');
-        return;
+        _allCities = cached.map((s) => s.city).toSet().toList()..sort();
+        onProgress?.call(1, cached.length);
+        debugPrint('[Cache] ${city.label} 從 SQLite 快取載入 ${cached.length} 筆');
+        return cached;
       }
 
       // 2. 從 Asset / API 載入
+      final List<RouteStop> loaded;
       if (city == CitySource.taipei) {
-        _allStops = await _taipeiService.fetchRouteStops(
-          onProgress: (loaded) => onProgress?.call(1, loaded),
+        loaded = await _taipeiService.fetchRouteStops(
+          onProgress: (count) => onProgress?.call(1, count),
         );
       } else {
-        _allStops = await _ntpcService.fetchAllRouteStops(
+        loaded = await _ntpcService.fetchAllRouteStops(
           onProgress: onProgress,
         );
       }
-      _allCities = _allStops.map((s) => s.city).toSet().toList()..sort();
+      _allStops = loaded;
+      _allCities = loaded.map((s) => s.city).toSet().toList()..sort();
 
       // 3. 存入 SQLite 快取
-      if (_allStops.isNotEmpty) {
-        _cacheService.save(city.name, _allStops); // 不等待，背景儲存
-        debugPrint('[Cache] ${city.label} 已存入 SQLite 快取 ${_allStops.length} 筆');
+      if (loaded.isNotEmpty) {
+        _cacheService.save(city.name, loaded); // 不等待，背景壓縮儲存
+        debugPrint('[Cache] ${city.label} 已存入 SQLite 快取 ${loaded.length} 筆');
       }
+      return loaded;
     } catch (e) {
       debugPrint('Failed to load route stops: $e');
       rethrow;
     } finally {
-      _isLoading = false;
+      _loadingCount = (_loadingCount - 1).clamp(0, 999);
       notifyListeners();
     }
   }

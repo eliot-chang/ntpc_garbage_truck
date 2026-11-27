@@ -1,9 +1,73 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:http/http.dart' as http;
 import '../models/route_stop.dart';
 import 'csv_parser.dart';
+
+/// 在背景 Isolate 將台北市 CSV 轉換為統一的 RouteStop 格式
+List<RouteStop> _parseTaipeiCsvIsolate(String csvContent) {
+  final clean = csvContent.replaceAll('\uFEFF', '');
+  final rows = CsvParser.parse(clean);
+
+  final grouped = <String, List<Map<String, String>>>{};
+  for (final row in rows) {
+    final key = '${row['局編'] ?? ''}_${row['車次'] ?? ''}';
+    grouped.putIfAbsent(key, () => []).add(row);
+  }
+
+  final stops = <RouteStop>[];
+  for (final group in grouped.values) {
+    for (int i = 0; i < group.length; i++) {
+      final stop = _mapTaipeiRowToRouteStop(group[i], i + 1);
+      if (stop != null) stops.add(stop);
+    }
+  }
+  return stops;
+}
+
+RouteStop? _mapTaipeiRowToRouteStop(Map<String, dynamic> row, int rank) {
+  final lat = double.tryParse(row['緯度'] ?? '');
+  final lng = double.tryParse(row['經度'] ?? '');
+  if (lat == null || lng == null) return null;
+
+  final rawTime = row['抵達時間'] ?? '';
+  final time = _formatTaipeiTime(rawTime);
+  final lineId = '${row['局編'] ?? ''}_${row['車次'] ?? ''}';
+  final lineName = '${row['路線'] ?? ''}${row['車次'] ?? ''}';
+
+  const weekdays = <int, bool>{
+    1: true, 2: true, 3: true, 4: true, 5: true, 6: true, 7: false,
+  };
+
+  return RouteStop(
+    city: row['行政區'] ?? '',
+    lineId: lineId,
+    lineName: lineName,
+    rank: rank,
+    name: row['地點'] ?? '',
+    village: row['里別'] ?? '',
+    longitude: lng,
+    latitude: lat,
+    time: time,
+    memo: '',
+    garbageDays: weekdays,
+    recyclingDays: weekdays,
+    foodScrapsDays: weekdays,
+  );
+}
+
+String _formatTaipeiTime(String raw) {
+  final digits = raw.replaceAll(RegExp(r'[^0-9]'), '');
+  if (digits.length == 4) {
+    return '${digits.substring(0, 2)}:${digits.substring(2)}';
+  }
+  if (digits.length == 3) {
+    return '0${digits.substring(0, 1)}:${digits.substring(1)}';
+  }
+  return raw;
+}
 
 /// 台北市垃圾車資料服務
 class TaipeiApiService {
@@ -26,10 +90,10 @@ class TaipeiApiService {
   }) async {
     if (_cachedStops != null) return _cachedStops!;
 
-    // 1. 內建 asset（秒載）
+    // 1. 內建 asset（背景 Isolate 解析）
     try {
       final csv = await rootBundle.loadString('assets/taipei_route_stops.csv');
-      final stops = _parseTaipeiCsv(csv);
+      final stops = await compute(_parseTaipeiCsvIsolate, csv);
       if (stops.isNotEmpty) {
         _cachedStops = stops;
         onProgress?.call(stops.length);
@@ -50,7 +114,7 @@ class TaipeiApiService {
     try {
       final response = await _client.get(Uri.parse(_csvUrl)).timeout(_timeout);
       if (response.statusCode == 200 && !response.body.trimLeft().startsWith('<')) {
-        final stops = _parseTaipeiCsv(response.body);
+        final stops = await compute(_parseTaipeiCsvIsolate, response.body);
         if (stops.isNotEmpty) {
           _cachedStops = stops;
           onProgress?.call(stops.length);
@@ -101,7 +165,7 @@ class TaipeiApiService {
     for (final group in grouped.values) {
       for (int i = 0; i < group.length; i++) {
         final row = group[i];
-        final stop = _mapToRouteStop({
+        final stop = _mapTaipeiRowToRouteStop({
           '行政區': row['行政區']?.toString() ?? '',
           '里別': row['里別']?.toString() ?? '',
           '局編': row['局編']?.toString() ?? '',
@@ -117,80 +181,6 @@ class TaipeiApiService {
       }
     }
     return stops;
-  }
-
-  /// 將台北市 CSV 轉換為統一的 RouteStop 格式
-  List<RouteStop> _parseTaipeiCsv(String csvContent) {
-    // 移除 BOM
-    final clean = csvContent.replaceAll('\uFEFF', '');
-    final rows = CsvParser.parse(clean);
-
-    // 依路線+車次分組，為每組內的站點編排 rank
-    final grouped = <String, List<Map<String, String>>>{};
-    for (final row in rows) {
-      final key = '${row['局編'] ?? ''}_${row['車次'] ?? ''}';
-      grouped.putIfAbsent(key, () => []).add(row);
-    }
-
-    final stops = <RouteStop>[];
-    for (final entry in grouped.entries) {
-      final group = entry.value;
-      for (int i = 0; i < group.length; i++) {
-        final row = group[i];
-        final stop = _mapToRouteStop(row, i + 1);
-        if (stop != null) stops.add(stop);
-      }
-    }
-
-    return stops;
-  }
-
-  RouteStop? _mapToRouteStop(Map<String, dynamic> row, int rank) {
-    final lat = double.tryParse(row['緯度'] ?? '');
-    final lng = double.tryParse(row['經度'] ?? '');
-    if (lat == null || lng == null) return null;
-
-    // 抵達時間 "1630" → "16:30"
-    final rawTime = row['抵達時間'] ?? '';
-    final time = _formatTime(rawTime);
-
-    // 台北市用 局編_車次 作為 lineId
-    final lineId = '${row['局編'] ?? ''}_${row['車次'] ?? ''}';
-    // 路線名含車次
-    final lineName = '${row['路線'] ?? ''}${row['車次'] ?? ''}';
-
-    // 台北市無星期資料，預設週一到週六有服務
-    final weekdays = <int, bool>{
-      1: true, 2: true, 3: true, 4: true, 5: true, 6: true, 7: false,
-    };
-
-    return RouteStop(
-      city: row['行政區'] ?? '',
-      lineId: lineId,
-      lineName: lineName,
-      rank: rank,
-      name: row['地點'] ?? '',
-      village: row['里別'] ?? '',
-      longitude: lng,
-      latitude: lat,
-      time: time,
-      memo: '',
-      garbageDays: weekdays,
-      recyclingDays: weekdays,
-      foodScrapsDays: weekdays,
-    );
-  }
-
-  /// "1630" → "16:30"
-  String _formatTime(String raw) {
-    final digits = raw.replaceAll(RegExp(r'[^0-9]'), '');
-    if (digits.length == 4) {
-      return '${digits.substring(0, 2)}:${digits.substring(2)}';
-    }
-    if (digits.length == 3) {
-      return '0${digits.substring(0, 1)}:${digits.substring(1)}';
-    }
-    return raw;
   }
 
   void clearCache() => _cachedStops = null;
