@@ -30,6 +30,7 @@ class NotificationService {
   /// 檢查所有最愛站點，車輛接近時發送通知
   Future<void> checkAndNotify({
     required List<RouteStop> allStops,
+    Map<String, List<RouteStop>>? stopsByLineId,
     required List<TruckLocation> truckLocations,
     required List<RouteStop> favorites,
     required int stopsBeforeArrival,
@@ -58,10 +59,12 @@ class NotificationService {
       }
       if (truck == null) continue;
 
-      // 找車輛最近的站點 rank
-      final routeStops = allStops
-          .where((s) => s.lineId == fav.lineId && s.hasValidCoordinates)
-          .toList();
+      // 優先用 O(1) 路線索引查詢，避免對全部 26,000+ 筆站點全表掃描
+      final routeStops = stopsByLineId != null
+          ? (stopsByLineId[fav.lineId] ?? const <RouteStop>[])
+          : allStops
+              .where((s) => s.lineId == fav.lineId && s.hasValidCoordinates)
+              .toList();
       final truckRank = _findNearestStopRank(routeStops, truck);
       if (truckRank == null) continue;
 

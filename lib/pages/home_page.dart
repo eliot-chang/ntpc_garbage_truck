@@ -26,7 +26,13 @@ const _weekdayLabels = {
 class HomePage extends StatefulWidget {
   final FavoritesService favoritesService;
   final SettingsService settingsService;
-  const HomePage({super.key, required this.favoritesService, required this.settingsService});
+  final bool isActive;
+  const HomePage({
+    super.key,
+    required this.favoritesService,
+    required this.settingsService,
+    this.isActive = true,
+  });
   @override
   State<HomePage> createState() => _HomePageState();
 }
@@ -38,16 +44,23 @@ class _HomePageState extends State<HomePage> {
   // 兩市資料分開存
   List<RouteStop> _ntpcStops = [];
   List<RouteStop> _taipeiStops = [];
+  // 依 lineId 預先分組並按 rank 排序（O(1) 查詢，避免全表 .where() 掃描）
+  Map<String, List<RouteStop>> _ntpcStopsByLine = {};
+  Map<String, List<RouteStop>> _taipeiStopsByLine = {};
   List<TruckLocation> _truckLocations = [];
+  String _lastTruckSignature = '';
+  DateTime? _lastTruckRefreshAt;
 
   // 空間索引
   final SpatialIndex _ntpcIndex = SpatialIndex();
   final SpatialIndex _taipeiIndex = SpatialIndex();
   SpatialIndex get _currentIndex => _citySource == CitySource.taipei ? _taipeiIndex : _ntpcIndex;
 
-  // 目前選中的市 → 對應的 stops
+  // 目前選中的市 → 對應的 stops 與路線索引
   CitySource _citySource = CitySource.newTaipei;
   List<RouteStop> get _allStops => _citySource == CitySource.taipei ? _taipeiStops : _ntpcStops;
+  Map<String, List<RouteStop>> get _currentStopsByLine =>
+      _citySource == CitySource.taipei ? _taipeiStopsByLine : _ntpcStopsByLine;
   List<String> _allCities = [];
   double _currentZoom = 16;
 
@@ -55,8 +68,6 @@ class _HomePageState extends State<HomePage> {
   bool _isLoadingTrucks = false;
   bool _iconsReady = false;
   String? _errorMessage;
-  String? _dataSourceInfo;
-  Timer? _dataSourceTimer;
   Timer? _progressTimer;
   Timer? _cameraDebounce;
   static const _refreshIntervalSec = 30;
@@ -68,12 +79,13 @@ class _HomePageState extends State<HomePage> {
   final Set<String> _selectedRouteIds = {};
   LatLng _pinPosition = _defaultPosition;
 
-  // icon 快取
-  final Map<int, BitmapDescriptor> _dotIconCache = {};
-  BitmapDescriptor? _passedGreyIcon;
-  final Map<int, BitmapDescriptor> _truckAtStopIconCache = {};
-  final Map<int, BitmapDescriptor> _arrowIconCache = {};
-  BitmapDescriptor? _passedArrowIcon;
+  // 全域靜態 icon 快取（避免重建 State 時重複繪製 32 張 PNG）
+  static final Map<int, BitmapDescriptor> _dotIconCache = {};
+  static BitmapDescriptor? _passedGreyIcon;
+  static final Map<int, BitmapDescriptor> _truckAtStopIconCache = {};
+  static final Map<int, BitmapDescriptor> _arrowIconCache = {};
+  static BitmapDescriptor? _passedArrowIcon;
+  static bool _staticIconsReady = false;
 
   // 地圖元素快取（避免每次 build 重算）
   Set<Polyline> _cachedPolylines = {};
@@ -102,6 +114,41 @@ class _HomePageState extends State<HomePage> {
     Color(0xFFE65100), // 深橘
   ];
 
+  /// 依 lineId 決定固定路線顏色（移動地圖、切換篩選、重開 App 顏色都不會跳動）
+  static Color _colorForLineId(String lineId) {
+    // 新北市為純數字連號（如 220001..220010），直接取餘數可讓同區相鄰路線零撞色
+    final numeric = int.tryParse(lineId);
+    if (numeric != null) {
+      return _routeColors[numeric.abs() % _routeColors.length];
+    }
+    // 台北市格式如 "103-074_第1車"：局編 FNV-1a 雜湊 + 車次偏移，同路線不同車次不撞色
+    final parts = lineId.split('_');
+    final base = parts.first;
+    int hash = 2166136261;
+    for (int i = 0; i < base.length; i++) {
+      hash ^= base.codeUnitAt(i);
+      hash = (hash * 16777619) & 0x7FFFFFFF;
+    }
+    int tripOffset = 0;
+    if (parts.length > 1) {
+      final digits = parts.sublist(1).join().replaceAll(RegExp(r'[^0-9]'), '');
+      tripOffset = int.tryParse(digits) ?? 0;
+    }
+    return _routeColors[(hash + tripOffset) % _routeColors.length];
+  }
+
+  static Map<String, List<RouteStop>> _buildLineIndex(List<RouteStop> stops) {
+    final map = <String, List<RouteStop>>{};
+    for (final stop in stops) {
+      if (!stop.hasValidCoordinates) continue;
+      map.putIfAbsent(stop.lineId, () => []).add(stop);
+    }
+    for (final list in map.values) {
+      list.sort((a, b) => a.rank.compareTo(b.rank));
+    }
+    return map;
+  }
+
   static TimePeriod _defaultPeriod() {
     final hour = DateTime.now().hour;
     if (hour < 12) return TimePeriod.morning;
@@ -112,12 +159,36 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    _iconsReady = _staticIconsReady;
     _init();
     widget.settingsService.addListener(_onSettingsChanged);
-    _startProgressTimer();
+    if (widget.isActive) {
+      _startProgressTimer();
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant HomePage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.isActive != widget.isActive) {
+      if (widget.isActive) {
+        _startProgressTimer();
+        // 離開地圖超過 30 秒再切回時靜默刷新車況
+        final last = _lastTruckRefreshAt;
+        if (!_isLoadingRoutes &&
+            (last == null ||
+                DateTime.now().difference(last).inSeconds >= _refreshIntervalSec)) {
+          _loadTruckLocations();
+        }
+      } else {
+        _progressTimer?.cancel();
+        _progressTimer = null;
+      }
+    }
   }
 
   Future<void> _createIcons() async {
+    if (_staticIconsReady) return;
     for (final color in _routeColors) {
       _dotIconCache[color.hashCode] = await _createCircleIcon(color, 10);
       _truckAtStopIconCache[color.hashCode] = await _createTruckIcon(color);
@@ -125,6 +196,7 @@ class _HomePageState extends State<HomePage> {
     }
     _passedGreyIcon = await _createCircleIcon(const Color(0xFFD0D0D0), 10);
     _passedArrowIcon = await _createArrowIcon(const Color(0xFFD0D0D0));
+    _staticIconsReady = true;
   }
 
   /// 圓點 icon
@@ -138,6 +210,8 @@ class _HomePageState extends State<HomePage> {
     final picture = recorder.endRecording();
     final image = await picture.toImage(size * 2, size * 2);
     final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
+    image.dispose();
+    picture.dispose();
     return BitmapDescriptor.bytes(bytes!.buffer.asUint8List());
   }
 
@@ -167,6 +241,8 @@ class _HomePageState extends State<HomePage> {
     final picture = recorder.endRecording();
     final image = await picture.toImage(size * 2, size * 2);
     final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
+    image.dispose();
+    picture.dispose();
     return BitmapDescriptor.bytes(bytes!.buffer.asUint8List());
   }
 
@@ -188,6 +264,8 @@ class _HomePageState extends State<HomePage> {
     final picture = recorder.endRecording();
     final image = await picture.toImage(size * 2, size * 2);
     final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
+    image.dispose();
+    picture.dispose();
     return BitmapDescriptor.bytes(bytes!.buffer.asUint8List());
   }
 
@@ -228,34 +306,33 @@ class _HomePageState extends State<HomePage> {
     } catch (_) {}
   }
 
-  /// 同時載入兩市資料
+  /// 同時載入兩市資料（直接接收回傳值，避免並行寫入共用欄位競態）
   Future<void> _loadBothCities() async {
     setState(() { _isLoadingRoutes = true; _errorMessage = null; _loadedPages = 0; _loadedItems = 0; });
     try {
-      // 並行載入
-      await Future.wait([
+      final results = await Future.wait([
         _dataService.loadRouteStops(
           city: CitySource.newTaipei,
           onProgress: (pages, items) { if (mounted) setState(() { _loadedPages = pages; _loadedItems = items; }); },
-        ).then((_) { _ntpcStops = List.from(_dataService.allStops); }),
+        ),
         _dataService.loadRouteStops(
           city: CitySource.taipei,
           onProgress: (_, __) {},
-        ).then((_) { _taipeiStops = List.from(_dataService.allStops); }),
+        ),
       ]);
+      _ntpcStops = results[0];
+      _taipeiStops = results[1];
 
-      // 建立空間索引
+      // 建立空間索引與 O(1) 路線索引
       _ntpcIndex.build(_ntpcStops);
       _taipeiIndex.build(_taipeiStops);
+      _ntpcStopsByLine = _buildLineIndex(_ntpcStops);
+      _taipeiStopsByLine = _buildLineIndex(_taipeiStops);
 
       if (mounted) {
-        final total = _ntpcStops.length + _taipeiStops.length;
         setState(() {
           _isLoadingRoutes = false;
-          _dataSourceInfo = '已載入 $total 個站點（雙北）';
         });
-        _dataSourceTimer?.cancel();
-        _dataSourceTimer = Timer(const Duration(seconds: 3), () { if (mounted) setState(() => _dataSourceInfo = null); });
       }
     } catch (e) {
       if (mounted) setState(() { _errorMessage = e.toString(); _isLoadingRoutes = false; });
@@ -264,6 +341,21 @@ class _HomePageState extends State<HomePage> {
 
   void _refreshCityList() {
     _allCities = _allStops.map((s) => s.city).toSet().toList()..sort();
+  }
+
+  static String _truckSignature(List<TruckLocation> trucks) {
+    if (trucks.isEmpty) return '';
+    final buf = StringBuffer();
+    for (final t in trucks) {
+      buf
+        ..write(t.lineId)
+        ..write('@')
+        ..write(t.latitude.toStringAsFixed(4))
+        ..write(',')
+        ..write(t.longitude.toStringAsFixed(4))
+        ..write(';');
+    }
+    return buf.toString();
   }
 
   Future<void> _loadTruckLocations() async {
@@ -276,12 +368,13 @@ class _HomePageState extends State<HomePage> {
       } else {
         newLocations = _estimateTaipeiTrucks();
       }
+      _lastTruckRefreshAt = DateTime.now();
 
       if (mounted) {
-        // 只在車輛資料有變化時才重建（避免不必要的 marker 替換）
-        final changed = newLocations.length != _truckLocations.length ||
-            (newLocations.isNotEmpty && _truckLocations.isNotEmpty &&
-             newLocations.first.location != _truckLocations.first.location);
+        // 比對全部車輛位置簽章，任何一台車移動都能即時刷新且無變動時不重建
+        final newSig = _truckSignature(newLocations);
+        final changed = newSig != _lastTruckSignature;
+        _lastTruckSignature = newSig;
         _truckLocations = newLocations;
         _isLoadingTrucks = false;
         if (changed) _rebuildMapData();
@@ -289,6 +382,7 @@ class _HomePageState extends State<HomePage> {
         if (widget.settingsService.notificationsEnabled) {
           await NotificationService().checkAndNotify(
             allStops: _allStops,
+            stopsByLineId: _currentStopsByLine,
             truckLocations: _truckLocations,
             favorites: widget.favoritesService.favorites,
             stopsBeforeArrival: widget.settingsService.stopsBeforeArrival,
@@ -300,22 +394,16 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// 台北市：根據當前時間推估每條路線的車輛在哪個站
+  /// 台北市：根據當前時間推估每條路線的車輛在哪個站（直接走預排序 _taipeiStopsByLine）
   List<TruckLocation> _estimateTaipeiTrucks() {
     final now = DateTime.now();
     final nowMinutes = now.hour * 60 + now.minute;
     final today = now.weekday;
 
-    // 依路線分組
-    final grouped = <String, List<RouteStop>>{};
-    for (final s in _taipeiStops) {
-      if (!s.hasServiceOnWeekday(today)) continue;
-      grouped.putIfAbsent(s.lineId, () => []).add(s);
-    }
-
     final trucks = <TruckLocation>[];
-    for (final entry in grouped.entries) {
-      final stops = entry.value..sort((a, b) => a.rank.compareTo(b.rank));
+    for (final entry in _taipeiStopsByLine.entries) {
+      final stops = entry.value;
+      if (stops.isEmpty || !stops.first.hasServiceOnWeekday(today)) continue;
 
       // 找目前時間最接近的站（車輛正在前往或剛離開）
       RouteStop? currentStop;
@@ -329,7 +417,7 @@ class _HomePageState extends State<HomePage> {
         }
       }
 
-      if (currentStop != null && currentStop.hasValidCoordinates) {
+      if (currentStop != null) {
         trucks.add(TruckLocation(
           lineId: entry.key,
           car: '台北${stops.first.lineName}',
@@ -452,13 +540,13 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _updateVisibleRoutes() {
-    // 先計算可見路線，更新選取狀態，再重建地圖資料
+    // 單次計算可見路線並直接傳入 _rebuildMapData，避免重複執行 3 次空間查詢
     final visibleRoutes = _computeVisibleRoutes();
     _selectedRouteIds.retainAll(visibleRoutes.keys);
     for (final key in visibleRoutes.keys) {
       if (!_selectedRouteIds.contains(key)) _selectedRouteIds.add(key);
     }
-    _rebuildMapData();
+    _rebuildMapData(precomputedRoutes: visibleRoutes);
   }
 
   static double _distanceKm(LatLng a, LatLng b) {
@@ -497,8 +585,7 @@ class _HomePageState extends State<HomePage> {
     return h * 60 + m;
   }
 
-  bool _isStopPassed(RouteStop stop) {
-    final now = DateTime.now();
+  bool _isStopPassed(RouteStop stop, DateTime now) {
     if (_selectedWeekday != now.weekday) return false;
     if (!stop.hasServiceOnWeekday(now.weekday)) return false;
     final stopMinutes = _timeToMinutes(stop.time);
@@ -506,51 +593,62 @@ class _HomePageState extends State<HomePage> {
     return stopMinutes < now.hour * 60 + now.minute;
   }
 
+  /// O(1) 透過 _currentStopsByLine 找車輛最近站點 rank，不再掃全表
   int? _findNearestStopRank(String lineId, TruckLocation truck) {
-    final routeStops = _allStops.where((s) => s.lineId == lineId && s.hasValidCoordinates).toList();
-    if (routeStops.isEmpty) return null;
-    int? nearestRank; double minDist = double.infinity;
-    final truckPos = LatLng(truck.latitude, truck.longitude);
+    final routeStops = _currentStopsByLine[lineId];
+    if (routeStops == null || routeStops.isEmpty) return null;
+    int? nearestRank;
+    double minDistSq = double.infinity;
+    final cosLat = cos(truck.latitude * pi / 180);
     for (final stop in routeStops) {
-      final dist = _distanceKm(truckPos, LatLng(stop.latitude, stop.longitude));
-      if (dist < minDist) { minDist = dist; nearestRank = stop.rank; }
+      final dLat = stop.latitude - truck.latitude;
+      final dLng = (stop.longitude - truck.longitude) * cosLat;
+      final distSq = dLat * dLat + dLng * dLng;
+      if (distSq < minDistSq) {
+        minDistSq = distSq;
+        nearestRank = stop.rank;
+      }
     }
     return nearestRank;
   }
 
   // ─── 地圖資料重建（核心效能優化：只在資料變更時計算一次）───
 
-  void _rebuildMapData() {
-    // 1. 計算可見路線
-    _cachedVisibleRoutes = _computeVisibleRoutes();
-    _cachedRouteKeys = _cachedVisibleRoutes.keys.toList();
+  void _rebuildMapData({Map<String, List<RouteStop>>? precomputedRoutes}) {
+    final now = DateTime.now();
 
-    // 2. 取得選中路線的 nearby stops（空間索引 + 路線篩選）
-    final validLineIds = _cachedVisibleRoutes.keys.where(_selectedRouteIds.contains).toSet();
-    final nearbyStops = _currentIndex
-        .queryRadius(_pinPosition.latitude, _pinPosition.longitude, _radiusKm)
-        .where((s) => validLineIds.contains(s.lineId))
-        .toList();
+    // 1. 取得可見路線（若有傳入直接重用，不再重複查 SpatialIndex）
+    _cachedVisibleRoutes = precomputedRoutes ?? _computeVisibleRoutes();
+    _cachedRouteKeys = _cachedVisibleRoutes.keys.toList()..sort();
 
-    // 3. 建構 color map（lineId → color）
-    final colorMap = <String, Color>{};
-    for (int i = 0; i < _cachedRouteKeys.length; i++) {
-      colorMap[_cachedRouteKeys[i]] = _routeColors[i % _routeColors.length];
+    // 2. 直接從可見路線取出選中路線的分組站點（已排序，不重查空間索引）
+    final selectedGrouped = <String, List<RouteStop>>{};
+    for (final lineId in _cachedRouteKeys) {
+      if (_selectedRouteIds.contains(lineId)) {
+        selectedGrouped[lineId] = _cachedVisibleRoutes[lineId]!;
+      }
     }
 
-    // 4. Truck nearest stops
+    // 3. 依 lineId 取得固定顏色（移動地圖不跳色）
+    final colorMap = <String, Color>{
+      for (final lineId in _cachedRouteKeys) lineId: _colorForLineId(lineId),
+    };
+
+    // 4. Truck nearest stops（O(1) 查路線表）
     final truckNearestStops = <String, int>{};
     for (final truck in _truckLocations) {
-      if (!_selectedRouteIds.contains(truck.lineId) || !truck.hasValidCoordinates) continue;
+      if (!selectedGrouped.containsKey(truck.lineId) || !truck.hasValidCoordinates) {
+        continue;
+      }
       final rank = _findNearestStopRank(truck.lineId, truck);
       if (rank != null) truckNearestStops[truck.lineId] = rank;
     }
 
-    // 5. Build polylines
-    _cachedPolylines = _computePolylines(nearbyStops, colorMap);
+    // 5. Build polylines（連續同狀態線段合併，減少原生層 Polyline 數量）
+    _cachedPolylines = _computePolylines(selectedGrouped, colorMap, now);
 
     // 6. Build markers
-    _cachedMarkers = _computeMarkers(nearbyStops, colorMap, truckNearestStops);
+    _cachedMarkers = _computeMarkers(selectedGrouped, colorMap, truckNearestStops, now);
 
     // 7. Build circles
     _cachedCircles = {
@@ -574,7 +672,9 @@ class _HomePageState extends State<HomePage> {
       _pinPosition.latitude, _pinPosition.longitude, _radiusKm,
     );
     final grouped = <String, List<RouteStop>>{};
-    for (final stop in nearbyStops) grouped.putIfAbsent(stop.lineId, () => []).add(stop);
+    for (final stop in nearbyStops) {
+      grouped.putIfAbsent(stop.lineId, () => []).add(stop);
+    }
     final filtered = <String, List<RouteStop>>{};
     for (final entry in grouped.entries) {
       final stops = entry.value;
@@ -592,38 +692,63 @@ class _HomePageState extends State<HomePage> {
 
   static const _passedColor = Color(0xFFD0D0D0);
 
-  Set<Polyline> _computePolylines(List<RouteStop> stops, Map<String, Color> colorMap) {
-    final grouped = <String, List<RouteStop>>{};
-    for (final stop in stops) grouped.putIfAbsent(stop.lineId, () => []).add(stop);
-
+  Set<Polyline> _computePolylines(
+    Map<String, List<RouteStop>> groupedStops,
+    Map<String, Color> colorMap,
+    DateTime now,
+  ) {
     final polylines = <Polyline>{};
-    for (final entry in grouped.entries) {
-      final sorted = entry.value..sort((a, b) => a.rank.compareTo(b.rank));
-      final validStops = sorted.where((s) => s.hasValidCoordinates).toList();
+    for (final entry in groupedStops.entries) {
+      final validStops = entry.value.where((s) => s.hasValidCoordinates).toList();
       if (validStops.length < 2) continue;
 
-      final color = colorMap[entry.key] ?? _routeColors[0];
+      final color = colorMap[entry.key] ?? _colorForLineId(entry.key);
+
+      int runIndex = 0;
+      bool? currentPassed;
+      List<LatLng> runPoints = [];
+
+      void flushRun() {
+        final passed = currentPassed;
+        if (runPoints.length >= 2 && passed != null) {
+          polylines.add(Polyline(
+            polylineId: PolylineId('${entry.key}_run_${runIndex++}'),
+            points: runPoints,
+            color: passed ? _passedColor : color,
+            width: passed ? 3 : 4,
+          ));
+        }
+      }
 
       for (int i = 0; i < validStops.length - 1; i++) {
         final from = validStops[i];
         final to = validStops[i + 1];
-        final bothPassed = _isStopPassed(from) && _isStopPassed(to);
+        final bothPassed = _isStopPassed(from, now) && _isStopPassed(to, now);
+        final fromLatLng = LatLng(from.latitude, from.longitude);
+        final toLatLng = LatLng(to.latitude, to.longitude);
 
-        polylines.add(Polyline(
-          polylineId: PolylineId('${entry.key}_seg_$i'),
-          points: [
-            LatLng(from.latitude, from.longitude),
-            LatLng(to.latitude, to.longitude),
-          ],
-          color: bothPassed ? _passedColor : color,
-          width: bothPassed ? 3 : 4,
-        ));
+        if (currentPassed == null) {
+          currentPassed = bothPassed;
+          runPoints = [fromLatLng, toLatLng];
+        } else if (currentPassed == bothPassed) {
+          runPoints.add(toLatLng);
+        } else {
+          flushRun();
+          currentPassed = bothPassed;
+          runPoints = [fromLatLng, toLatLng];
+        }
       }
+      flushRun();
     }
     return polylines;
   }
 
-  Set<Marker> _computeMarkers(List<RouteStop> stops, Map<String, Color> colorMap, Map<String, int> truckNearestStops) {
+  Set<Marker> _computeMarkers(
+    Map<String, List<RouteStop>> groupedStops,
+    Map<String, Color> colorMap,
+    Map<String, int> truckNearestStops,
+    DateTime now,
+  ) {
     if (!_iconsReady) return {};
     final markers = <Marker>{};
 
@@ -634,55 +759,53 @@ class _HomePageState extends State<HomePage> {
     // 避免重疊：追蹤已用座標（精度到小數 4 位 ≈ 11m）
     final usedPositions = <String>{};
 
-    for (final stop in stops) {
-      if (!stop.hasValidCoordinates) continue;
+    for (final entry in groupedStops.entries) {
+      final lineId = entry.key;
+      final stops = entry.value;
+      final color = colorMap[lineId] ?? _colorForLineId(lineId);
+      final nearestRank = truckNearestStops[lineId];
 
-      // 座標去重，防止同位置多個 marker 堆疊導致點擊困難
-      final posKey = '${stop.latitude.toStringAsFixed(4)}_${stop.longitude.toStringAsFixed(4)}';
-      if (usedPositions.contains(posKey)) continue;
-      usedPositions.add(posKey);
+      for (final stop in stops) {
+        if (!stop.hasValidCoordinates) continue;
 
-      final color = colorMap[stop.lineId] ?? _routeColors[0];
-      final isPassed = _isStopPassed(stop);
-      final isNearestToTruck = truckNearestStops[stop.lineId] == stop.rank;
+        // 座標去重，防止同位置多個 marker 堆疊導致點擊困難
+        final posKey = '${stop.latitude.toStringAsFixed(4)}_${stop.longitude.toStringAsFixed(4)}';
+        if (usedPositions.contains(posKey)) continue;
+        usedPositions.add(posKey);
 
-      BitmapDescriptor icon;
-      if (isNearestToTruck) {
-        icon = _truckAtStopIconCache[color.hashCode] ??
-            BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen);
-      } else if (isPassed) {
-        icon = _passedGreyIcon ?? BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed);
-      } else {
-        icon = _dotIconCache[color.hashCode] ?? BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed);
+        final isPassed = _isStopPassed(stop, now);
+        final isNearestToTruck = nearestRank == stop.rank;
+
+        BitmapDescriptor icon;
+        if (isNearestToTruck) {
+          icon = _truckAtStopIconCache[color.hashCode] ??
+              BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen);
+        } else if (isPassed) {
+          icon = _passedGreyIcon ?? BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed);
+        } else {
+          icon = _dotIconCache[color.hashCode] ?? BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed);
+        }
+
+        // 用 lineId+rank 確保唯一性，即使座標重疊也不會互相覆蓋
+        markers.add(Marker(
+          markerId: MarkerId('s_${stop.lineId}_${stop.rank}'),
+          position: LatLng(stop.latitude, stop.longitude),
+          icon: icon,
+          anchor: const Offset(0.5, 0.5),
+          zIndex: isNearestToTruck ? 20 : (isPassed ? 0 : 5),
+          onTap: () => _showStopSheet(stop, isNearestToTruck, isPassed),
+        ));
       }
 
-      // 用 lineId+rank 確保唯一性，即使座標重疊也不會互相覆蓋
-      markers.add(Marker(
-        markerId: MarkerId('s_${stop.lineId}_${stop.rank}'),
-        position: LatLng(stop.latitude, stop.longitude),
-        icon: icon,
-        anchor: const Offset(0.5, 0.5),
-        zIndex: isNearestToTruck ? 20 : (isPassed ? 0 : 5),
-        onTap: () => _showStopSheet(stop, isNearestToTruck, isPassed),
-      ));
-    }
-
-    // 箭頭 markers（zoom >= 15 才顯示）
-    if (!showArrows) return markers;
-    final grouped = <String, List<RouteStop>>{};
-    for (final stop in stops) grouped.putIfAbsent(stop.lineId, () => []).add(stop);
-
-    for (final entry in grouped.entries) {
-      final sorted = entry.value..sort((a, b) => a.rank.compareTo(b.rank));
-      final coords = sorted.where((s) => s.hasValidCoordinates).toList();
+      // 箭頭 markers（zoom >= 15 才顯示，直接使用已排序的 stops）
+      if (!showArrows) continue;
+      final coords = stops.where((s) => s.hasValidCoordinates).toList();
       if (coords.length < 2) continue;
-
-      final color = colorMap[entry.key] ?? _routeColors[0];
 
       for (int i = 0; i < coords.length - 1; i++) {
         final fromStop = coords[i];
         final toStop = coords[i + 1];
-        final bothPassed = _isStopPassed(fromStop) && _isStopPassed(toStop);
+        final bothPassed = _isStopPassed(fromStop, now) && _isStopPassed(toStop, now);
         final arrowIcon = bothPassed ? _passedArrowIcon : _arrowIconCache[color.hashCode];
         if (arrowIcon == null) continue;
 
@@ -693,7 +816,7 @@ class _HomePageState extends State<HomePage> {
 
         final angle = atan2(to.longitude - from.longitude, to.latitude - from.latitude);
         markers.add(Marker(
-          markerId: MarkerId('arrow_${entry.key}_$i'),
+          markerId: MarkerId('arrow_${lineId}_$i'),
           position: LatLng(midLat, midLng),
           icon: arrowIcon,
           anchor: const Offset(0.5, 0.5),
@@ -1039,22 +1162,29 @@ class _HomePageState extends State<HomePage> {
     if (routes.isEmpty) {
       return Text('範圍內無符合條件的路線', style: TextStyle(fontSize: 12, color: Colors.grey.shade500));
     }
-    final keys = routes.keys.toList();
+    final keys = _cachedRouteKeys;
     return SizedBox(
       height: 32,
       child: ListView.separated(
         scrollDirection: Axis.horizontal,
-        itemCount: routes.length,
+        itemCount: keys.length,
         separatorBuilder: (_, __) => const SizedBox(width: 4),
         itemBuilder: (context, i) {
           final id = keys[i];
           final name = routes[id]!.first.lineName;
-          final color = _routeColors[i % _routeColors.length];
+          final color = _colorForLineId(id);
           final sel = _selectedRouteIds.contains(id);
           return FilterChip(
             label: Text(name, style: TextStyle(fontSize: 10, color: sel ? color : Colors.grey)),
             selected: sel,
-            onSelected: (s) { if (s) _selectedRouteIds.add(id); else _selectedRouteIds.remove(id); _rebuildMapData(); },
+            onSelected: (s) {
+              if (s) {
+                _selectedRouteIds.add(id);
+              } else {
+                _selectedRouteIds.remove(id);
+              }
+              _rebuildMapData(precomputedRoutes: _cachedVisibleRoutes);
+            },
             selectedColor: color.withValues(alpha: 0.15),
             checkmarkColor: color,
             backgroundColor: Theme.of(context).colorScheme.surface,
@@ -1067,31 +1197,6 @@ class _HomePageState extends State<HomePage> {
         },
       ),
     );
-  }
-
-  Widget _buildRouteChips() {
-    final routes = _cachedVisibleRoutes;
-    if (routes.isEmpty) return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      child: Text('範圍內無符合條件的路線', style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
-    );
-    final keys = routes.keys.toList();
-    return SizedBox(height: 40, child: ListView.separated(
-      scrollDirection: Axis.horizontal, padding: const EdgeInsets.symmetric(horizontal: 12),
-      itemCount: routes.length, separatorBuilder: (_, __) => const SizedBox(width: 6),
-      itemBuilder: (context, i) {
-        final id = keys[i]; final name = routes[id]!.first.lineName;
-        final color = _routeColors[i % _routeColors.length]; final sel = _selectedRouteIds.contains(id);
-        return FilterChip(
-          label: Text(name, style: TextStyle(fontSize: 11, color: sel ? color : Colors.grey)),
-          selected: sel,
-          onSelected: (s) { if (s) _selectedRouteIds.add(id); else _selectedRouteIds.remove(id); _rebuildMapData(); },
-          selectedColor: color.withValues(alpha: 0.15), checkmarkColor: color, backgroundColor: Colors.white,
-          side: BorderSide(color: sel ? color : Colors.grey.shade300),
-          elevation: 2, shadowColor: Colors.black26, visualDensity: VisualDensity.compact,
-        );
-      },
-    ));
   }
 
   Widget _buildLoadingOverlay() => Center(child: Card(elevation: 8, child: Padding(
@@ -1115,7 +1220,6 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
-    _dataSourceTimer?.cancel();
     _progressTimer?.cancel();
     _cameraDebounce?.cancel();
     _refreshProgressNotifier.dispose();
